@@ -98,7 +98,9 @@ impl Crawler {
 
         let robots_txt_url = url.clone().join("/robots.txt").unwrap();
 
-        let req = ureq::get(robots_txt_url.as_str()).call();
+        let req = ureq::get(robots_txt_url.as_str())
+            .set("User-Agent", this.lock().unwrap().cfg.user_agent.as_str())
+            .call();
         let res = match req {
             Ok(response) => {
                 if response.get_url() != robots_txt_url.as_str() {
@@ -136,7 +138,9 @@ impl Crawler {
             return;
         }
 
-        let req = ureq::get(url.as_str()).call();
+        let req = ureq::get(url.as_str())
+            .set("User-Agent", this.lock().unwrap().cfg.user_agent.as_str())
+            .call();
         let res = match req {
             Ok(response) => {
                 if response.get_url() != url.as_str() {
