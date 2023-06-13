@@ -2,14 +2,13 @@
 extern crate log;
 extern crate pretty_env_logger;
 
-use std::env;
+use std::{env, thread};
 use std::fs;
 use std::sync::{Arc, Mutex};
+use std::thread::sleep;
+use std::time::Duration;
 
 use config::Config;
-use lazy_static::lazy_static;
-use sightnet_core::collection::Collection;
-use sightnet_core::field::FieldType;
 
 use crawler::Cfg;
 use crawler::Crawler;
@@ -45,22 +44,17 @@ fn main() {
         .try_deserialize::<Cfg>()
         .unwrap();
 
-    let db = sightnet_core::file::File::load(cfg.db_path.as_str());
-
-    if db.is_err() {
-        //there is no file, we should init collection and save it
-        let mut db = Collection::default();
-
-        db.push_field("url", FieldType::String);
-        db.push_field("title", FieldType::String);
-        db.push_field("desc", FieldType::String);
-        db.push_field("date", FieldType::Int);
-
-        sightnet_core::file::File::save(&db, cfg.db_path.as_str()).unwrap();
-    }
-
-    let crawler = Crawler::new(cfg);
+    let crawler = Crawler::new(cfg.clone());
     let arc = Arc::new(Mutex::new(crawler));
 
+    let _ = thread::spawn(move || {
+        loop {
+            ureq::get(&format!("{}/col/websites/commit", cfg.db_url)).call().unwrap();
+            ureq::get(&format!("{}/col/robots/commit", cfg.db_url)).call().unwrap();
+            sleep(Duration::from_secs(20));
+        }
+    });
+
+    info!("Starting...");
     Crawler::start_threads(arc.clone(), sites, *threads_count);
 }

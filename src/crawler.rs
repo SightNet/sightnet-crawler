@@ -1,13 +1,13 @@
 use std::collections::vec_deque::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::thread::{sleep, ThreadId};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread::sleep;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chrono::Utc;
 use lru_cache::LruCache;
 use scraper::Html;
 use serde::Deserialize;
+use serde_json::json;
 use texting_robots::Robot;
 use ureq;
 use ureq::Error;
@@ -15,13 +15,10 @@ use url::Url;
 
 use crate::helper::normalize_url;
 use crate::parser::Parser;
-use sightnet_core;
-use sightnet_core::field::FieldValue;
-use sightnet_core::file;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Cfg {
-    pub db_path: String,
+    pub db_url: String,
     pub user_agent: String,
     pub lru_cache_capacity: usize,
     pub http_reqs_timeout_for_thread: u16,
@@ -32,7 +29,6 @@ pub struct Crawler {
     work: bool,
     sites_queue: VecDeque<String>,
     cache: LruCache<String, bool>,
-    threads: Vec<(ThreadId, bool)>,
     cfg: Cfg,
 }
 
@@ -42,13 +38,12 @@ impl Crawler {
             work: false,
             sites_queue: VecDeque::new(),
             cache: LruCache::new(cfg.lru_cache_capacity.clone()),
-            threads: Vec::new(),
             cfg,
         }
     }
 
-    fn pop_sites(this: Arc<Mutex<Self>>) -> String {
-        this.lock().unwrap().sites_queue.pop_front().unwrap()
+    fn pop_sites(this: Arc<Mutex<Self>>) -> Option<String> {
+        this.lock().unwrap().sites_queue.pop_front()
     }
 
     fn push_sites(this: Arc<Mutex<Self>>, value: String) {
@@ -63,30 +58,7 @@ impl Crawler {
         this.lock().unwrap().cache.insert(key, value);
     }
 
-    fn has_active_thread(this: Arc<Mutex<Self>>) -> bool {
-        let mut has_active_thread = false;
-
-        this.lock().unwrap().threads.iter().for_each(|x| {
-            if x.1 {
-                has_active_thread = true;
-            }
-        });
-
-        has_active_thread
-    }
-
-    fn set_current_thread_active(this: Arc<Mutex<Self>>, active: bool) {
-        for x in this.lock().unwrap().threads.iter_mut() {
-            if x.0 == thread::current().id() {
-                *x = (x.0, active);
-            }
-        }
-    }
-
     pub fn process_site(this: Arc<Mutex<Self>>, url: String) {
-        let mut db = file::File::load(this.lock().unwrap().cfg.db_path.as_str()).expect("Error while loading!");
-        println!("len: {}", db.len());
-
         let mut url = Url::parse(&url).unwrap();
 
         let is_cached = Crawler::is_cache_contains(this.clone(), url.as_str().to_string());
@@ -111,18 +83,19 @@ impl Crawler {
                 response.into_string().unwrap()
             }
             Err(Error::Status(code, _response)) => {
-                //Crawler::put_cache(this.clone(), url.as_str().to_string(), false);
+                Crawler::put_cache(this.clone(), url.as_str().to_string(), false);
                 error!("{} - {}", robots_txt_url, code);
                 return;
             }
             Err(_) => {
-                //Crawler::put_cache(this.clone(), url.as_str().to_string(), false);
+                Crawler::put_cache(this.clone(), url.as_str().to_string(), false);
                 error!("{}", robots_txt_url);
                 return;
             }
         };
 
         if res.len() == 0 {
+            info!("Response is empty: {}", url.as_str());
             return;
         }
 
@@ -177,30 +150,38 @@ impl Crawler {
             Crawler::push_sites(this.clone(), parsed_url_obj.to_string());
         }
 
-        let mut doc = sightnet_core::document::Document::new();
         let date = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-        doc.push("url", FieldValue::from(url.to_string()));
-        doc.push("title", FieldValue::from(parsed_title));
-        doc.push("desc", FieldValue::from(parsed_desc));
-        doc.push("date", FieldValue::from(date as i64));
+        let guard = this.lock().unwrap();
+        let cfg = &guard.cfg;
 
-        db.push(doc, None);
+        let json = json!({
+            "url": url.to_string(),
+            "host": url.host_str().unwrap(),
+            "title": parsed_title,
+            "desc": parsed_desc,
+            "date": date
+        });
+        let db_url = format!("{}/col/websites/doc", cfg.db_url);
 
-        file::File::save(&db, this.lock().unwrap().cfg.db_path.as_str()).expect("Error while saving!");
+        ureq::put(&db_url).send_json(json).expect("Adding website to db");
 
         info!("{} - {} links", url.as_str(), parsed_urls.len());
 
-        Crawler::put_cache(this.clone(), url.as_str().to_string(), true);
+        drop(guard);
+        Crawler::put_cache(this.clone(), url.to_string(), true);
     }
 
     pub fn start_threads(this: Arc<Mutex<Self>>, sites: Vec<String>, threads_count: u16) {
         let mut threads = vec![];
         this.lock().unwrap().work = true;
+        info!("Threads count: {}", threads_count);
 
         for site in sites {
             this.lock().unwrap().sites_queue.push_back(site);
         }
+
+        info!("Sites count: {}", this.lock().unwrap().sites_queue.len());
 
         for _ in 0..threads_count {
             let thread = thread::spawn({
@@ -210,7 +191,6 @@ impl Crawler {
                 }
             });
 
-            this.lock().unwrap().threads.push((thread.thread().id(), false));
             threads.push(thread);
         }
 
@@ -224,26 +204,22 @@ impl Crawler {
 
         loop {
             if !this.lock().unwrap().work {
+                info!("Stopping work...");
                 break;
-            }
-
-            if this.lock().unwrap().sites_queue.is_empty() {
-                if !Crawler::has_active_thread(this.clone()) {
-                    info!("Thread has stopped! Because there are no threads which active(processing a site), and sites list is clear.");
-                    break;
-                }
-
-                // sleep(std::time::Duration::from_millis(500));
-                continue;
             }
 
             let site = Crawler::pop_sites(this.clone());
 
-            Crawler::set_current_thread_active(this.clone(), true);
-            Crawler::process_site(this.clone(), site);
-            Crawler::set_current_thread_active(this.clone(), false);
+            match site {
+                Some(site) => {
+                    Crawler::process_site(this.clone(), site);
+                }
+                None => {
+                    info!("There are no sites in queue");
+                }
+            }
 
-            sleep(std::time::Duration::from_secs(http_reqs_timeout_for_thread.into()));
+            sleep(Duration::from_secs(http_reqs_timeout_for_thread.into()));
         }
     }
 }

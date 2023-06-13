@@ -1,4 +1,4 @@
-db_path = "../db.bin"
+db_url = "http://localhost:1551"
 lru_cache_capacity = 128
 user_agent = "SightNet"
 http_reqs_timeout_for_thread = 5 #seconds
