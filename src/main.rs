@@ -34,6 +34,12 @@ fn main() {
         .split("\n")
         .map(|x| x.trim())
         .map(String::from)
+        .map(|x| {
+            if !x.contains("http") {
+                return format!("{}{x}", "https://").to_string()
+            }
+            x
+        })
         .filter(|x| !x.is_empty())
         .collect::<Vec<String>>();
 
